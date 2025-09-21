@@ -1,128 +1,117 @@
 # -*- coding: utf-8 -*-
 import discord
 from discord.ext import commands, tasks
-import asyncio
-import datetime
+import json
+import os
+from datetime import datetime, timedelta
 
-# -----------------------------
-# 設定部分
-# -----------------------------
-DEBUG = True  # デバッグ: True/Falseで切り替え
-CHECK_INTERVAL = 5 if DEBUG else 7200  # チェック間隔(秒): デバッグ5秒、本番2時間
-ROLE_DURATION = 10 if DEBUG else 60*60*24*30*3  # 削除期間(秒): デバッグ10秒、本番3か月
-LOG_CHANNEL_ID = 1419312151612489843  # ログ送信先チャンネルID
+# ====================== 設定 ======================
+DEBUG = True  # デバッグ用なら True、本番は False
 
-# 削除対象ロール名
-AUTO_REMOVE_ROLES = ["注意", "警告"]
+if DEBUG:
+    CHECK_INTERVAL = 5         # チェック間隔（秒）
+    REMOVE_AFTER = 10          # 削除までの期間（秒）
+else:
+    CHECK_INTERVAL = 60*60*2   # 2時間
+    REMOVE_AFTER = 60*60*24*30*3  # 3か月（秒）
 
-# データ保存用
-role_assign_times = {}  # {guild_id: {member_id: {role_name: datetime}}}
+ROLES_TO_AUTO_REMOVE = ["注意", "警告"]
+DATA_FILE = "roles_data.json"
+COMMAND_PREFIX = "!"
 
-# -----------------------------
-# Bot初期化
-# -----------------------------
+# ====================== Bot 初期化 ======================
 intents = discord.Intents.default()
+intents.members = True
 intents.message_content = True
-intents.members = True  # メンバー情報取得に必須
+bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+# ====================== データ操作 ======================
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
-# -----------------------------
-# ログ送信用関数
-# -----------------------------
-async def log_message(message):
-    channel = bot.get_channel(LOG_CHANNEL_ID)
-    if channel:
-        await channel.send(message)
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-# -----------------------------
-# Bot起動時イベント
-# -----------------------------
+role_data = load_data()  # {guild_id: {user_id: {role_name: timestamp}}}
+
+# ====================== 自動削除処理 ======================
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def check_roles():
+    now = datetime.utcnow().timestamp()
+    for guild in bot.guilds:
+        g_id = str(guild.id)
+        if g_id not in role_data:
+            continue
+        for user_id, roles in list(role_data[g_id].items()):
+            member = guild.get_member(int(user_id))
+            if not member:
+                continue
+            for role_name, ts in list(roles.items()):
+                if role_name not in ROLES_TO_AUTO_REMOVE:
+                    continue
+                if now - ts >= REMOVE_AFTER:
+                    role = discord.utils.get(guild.roles, name=role_name)
+                    if role and role in member.roles:
+                        try:
+                            await member.remove_roles(role)
+                            print(f"{member.name} から {role_name} を削除しました")
+                        except discord.Forbidden:
+                            print(f"{member.name} から {role_name} の削除に失敗しました（権限不足）")
+                    # 削除したのでデータも削除
+                    del role_data[g_id][user_id][role_name]
+            if not role_data[g_id][user_id]:
+                del role_data[g_id][user_id]
+    save_data(role_data)
+
+async def add_role_with_timestamp(member, role):
+    guild_id = str(member.guild.id)
+    user_id = str(member.id)
+    if guild_id not in role_data:
+        role_data[guild_id] = {}
+    if user_id not in role_data[guild_id]:
+        role_data[guild_id][user_id] = {}
+    role_data[guild_id][user_id][role.name] = datetime.utcnow().timestamp()
+    save_data(role_data)
+    await member.add_roles(role)
+
+# ====================== Bot イベント ======================
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    await log_message("Botがオンラインになりました")
-    # ステータス表示
     await bot.change_presence(
         status=discord.Status.online,
         activity=discord.Game("稼働中")
     )
-    # 起動時に既存のロール付与者を確認
-    for guild in bot.guilds:
-        if guild.id not in role_assign_times:
-            role_assign_times[guild.id] = {}
-        for role_name in AUTO_REMOVE_ROLES:
-            role = discord.utils.get(guild.roles, name=role_name)
-            if role:
-                for member in role.members:
-                    if member.id not in role_assign_times[guild.id]:
-                        role_assign_times[guild.id][member.id] = {}
-                    if role_name not in role_assign_times[guild.id][member.id]:
-                        # 起動時点からカウント開始
-                        role_assign_times[guild.id][member.id][role_name] = datetime.datetime.utcnow()
-                        await log_message(f"{member} に{role_name}ロールが付いていたため、カウント開始")
     check_roles.start()
 
-# -----------------------------
-# 自動ロール削除タスク
-# -----------------------------
-@tasks.loop(seconds=CHECK_INTERVAL)
-async def check_roles():
-    now = datetime.datetime.utcnow()
-    for guild in bot.guilds:
-        guild_data = role_assign_times.get(guild.id, {})
-        for member_id, roles in list(guild_data.items()):
-            member = guild.get_member(member_id)
-            if not member:
-                # メンバーがいない場合は記録削除
-                del role_assign_times[guild.id][member_id]
-                continue
-            for role_name, assign_time in list(roles.items()):
-                role = discord.utils.get(guild.roles, name=role_name)
-                # メンバーがロール持ってない場合は記録から削除
-                if not role or role not in member.roles:
-                    del role_assign_times[guild.id][member_id][role_name]
-                    continue
-                # 削除期間を過ぎていたらロール削除
-                if (now - assign_time).total_seconds() >= ROLE_DURATION:
-                    try:
-                        await member.remove_roles(role)
-                        await log_message(f"{member} から{role_name}ロールを削除しました")
-                    except discord.Forbidden:
-                        await log_message(f"{member} の{role_name}ロール削除に失敗しました(権限不足)")
-                    # 削除後は記録から消す
-                    del role_assign_times[guild.id][member_id][role_name]
-
-# -----------------------------
-# giveallコマンド
-# -----------------------------
+# ====================== コマンド ======================
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def giveall(ctx, role: discord.Role):
-    await ctx.send("処理を開始します…")
+    msg = await ctx.send("処理を開始します...")
     failed = []
     for member in ctx.guild.members:
         try:
-            await member.add_roles(role)
+            await add_role_with_timestamp(member, role)
         except discord.Forbidden:
             failed.append(member.name)
         except discord.HTTPException:
             failed.append(member.name)
-        else:
-            # 自動削除対象ロールなら付与時間記録
-            if role.name in AUTO_REMOVE_ROLES:
-                if ctx.guild.id not in role_assign_times:
-                    role_assign_times[ctx.guild.id] = {}
-                if member.id not in role_assign_times[ctx.guild.id]:
-                    role_assign_times[ctx.guild.id][member.id] = {}
-                role_assign_times[ctx.guild.id][member.id][role.name] = datetime.datetime.utcnow()
-    msg = f"{ctx.guild.member_count - len(failed)}人にロールを付与しました。"
+    text = f"{ctx.guild.member_count - len(failed)}人にロールを付与しました。"
     if failed:
-        msg += f"\n付与に失敗した人: {', '.join(failed)}"
-    await ctx.send(msg)
-    await log_message(f"{ctx.author} が giveall コマンドを使用して {role.name} を付与しました")
+        text += f"\n付与に失敗した人: {', '.join(failed)}"
+    await msg.edit(content=text)
 
-# -----------------------------
-# Bot実行
-# -----------------------------
-bot.run("botトークン")
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def test_add(ctx, role: discord.Role):
+    """デバッグ用: 自分にロール付与"""
+    await add_role_with_timestamp(ctx.author, role)
+    await ctx.send(f"{ctx.author.name} に {role.name} を付与しました（デバッグ用）")
+
+# ====================== Bot 実行 ======================
+bot.run("YOUR_TOKEN_HERE")
