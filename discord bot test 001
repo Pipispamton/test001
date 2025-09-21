@@ -4,6 +4,8 @@ from discord.ext import commands, tasks
 import json
 import os
 from datetime import datetime, timedelta
+import asyncio
+import shutil
 
 # ====================== 設定 ======================
 DEBUG = True  # デバッグ用なら True、本番は False
@@ -11,13 +13,17 @@ DEBUG = True  # デバッグ用なら True、本番は False
 if DEBUG:
     CHECK_INTERVAL = 5         # チェック間隔（秒）
     REMOVE_AFTER = 10          # 削除までの期間（秒）
+    BATCH_SIZE = 50            # 少人数ずつ処理
 else:
     CHECK_INTERVAL = 60*60*2   # 2時間
     REMOVE_AFTER = 60*60*24*30*3  # 3か月（秒）
+    BATCH_SIZE = 100
 
 ROLES_TO_AUTO_REMOVE = ["注意", "警告"]
 DATA_FILE = "roles_data.json"
+BACKUP_DIR = "backup"
 COMMAND_PREFIX = "!"
+LOG_CHANNEL_NAME = "bot-logs"
 
 # ====================== Bot 初期化 ======================
 intents = discord.Intents.default()
@@ -26,19 +32,85 @@ intents.message_content = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
 # ====================== データ操作 ======================
+def ensure_backup_dir():
+    if not os.path.exists(BACKUP_DIR):
+        os.makedirs(BACKUP_DIR)
+
+def backup_file():
+    ensure_backup_dir()
+    if os.path.exists(DATA_FILE):
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        backup_path = os.path.join(BACKUP_DIR, f"roles_data_{timestamp}.json")
+        shutil.copy2(DATA_FILE, backup_path)
+
 def load_data():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, PermissionError) as e:
+            print(f"Error loading {DATA_FILE}: {e}, attempting backup restore")
+            backups = sorted(os.listdir(BACKUP_DIR), reverse=True) if os.path.exists(BACKUP_DIR) else []
+            for b in backups:
+                path = os.path.join(BACKUP_DIR, b)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        print(f"Restored from backup {b}")
+                        return json.load(f)
+                except:
+                    continue
+            print("No valid backup found. Initializing empty data.")
     return {}
 
 def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        backup_file()
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Failed to save {DATA_FILE}: {e}")
 
 role_data = load_data()  # {guild_id: {user_id: {role_name: timestamp}}}
 
+# ====================== ログ送信 ======================
+async def log(guild, message):
+    try:
+        channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+        if channel:
+            await channel.send(message)
+        print(f"[{guild.name}] {message}")
+    except Exception as e:
+        print(f"Failed to log message: {e}")
+
 # ====================== 自動削除処理 ======================
+async def _process_member(guild, user_id, member_roles, now):
+    member = guild.get_member(int(user_id))
+    if not member:
+        return
+    guild_id = str(guild.id)
+    for role_name, ts in list(member_roles.items()):
+        if role_name not in ROLES_TO_AUTO_REMOVE:
+            continue
+        role = discord.utils.get(guild.roles, name=role_name)
+        if not role:
+            continue
+        # 削除判定
+        if now - ts >= REMOVE_AFTER:
+            try:
+                await member.remove_roles(role)
+                await log(guild, f"{member.name} から {role_name} を削除しました")
+            except discord.Forbidden:
+                await log(guild, f"{member.name} から {role_name} の削除に失敗（権限不足）")
+            except Exception as e:
+                await log(guild, f"{member.name} から {role_name} の削除に失敗: {e}")
+            del role_data[guild_id][user_id][role_name]
+        else:
+            # 時刻がない場合補完
+            if ts is None:
+                role_data[guild_id][user_id][role_name] = now
+    if not role_data[guild_id][user_id]:
+        del role_data[guild_id][user_id]
+
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def check_roles():
     now = datetime.utcnow().timestamp()
@@ -46,25 +118,11 @@ async def check_roles():
         g_id = str(guild.id)
         if g_id not in role_data:
             continue
-        for user_id, roles in list(role_data[g_id].items()):
-            member = guild.get_member(int(user_id))
-            if not member:
-                continue
-            for role_name, ts in list(roles.items()):
-                if role_name not in ROLES_TO_AUTO_REMOVE:
-                    continue
-                if now - ts >= REMOVE_AFTER:
-                    role = discord.utils.get(guild.roles, name=role_name)
-                    if role and role in member.roles:
-                        try:
-                            await member.remove_roles(role)
-                            print(f"{member.name} から {role_name} を削除しました")
-                        except discord.Forbidden:
-                            print(f"{member.name} から {role_name} の削除に失敗しました（権限不足）")
-                    # 削除したのでデータも削除
-                    del role_data[g_id][user_id][role_name]
-            if not role_data[g_id][user_id]:
-                del role_data[g_id][user_id]
+        user_ids = list(role_data[g_id].keys())
+        for i in range(0, len(user_ids), BATCH_SIZE):
+            batch = user_ids[i:i+BATCH_SIZE]
+            tasks_batch = [_process_member(guild, uid, role_data[g_id][uid], now) for uid in batch]
+            await asyncio.gather(*tasks_batch)
     save_data(role_data)
 
 async def add_role_with_timestamp(member, role):
@@ -74,34 +132,57 @@ async def add_role_with_timestamp(member, role):
         role_data[guild_id] = {}
     if user_id not in role_data[guild_id]:
         role_data[guild_id][user_id] = {}
-    role_data[guild_id][user_id][role.name] = datetime.utcnow().timestamp()
+    if role.name not in role_data[guild_id][user_id]:
+        role_data[guild_id][user_id][role.name] = datetime.utcnow().timestamp()
     save_data(role_data)
-    await member.add_roles(role)
+    try:
+        await member.add_roles(role)
+        await log(member.guild, f"{member.name} に {role.name} を付与しました")
+    except discord.Forbidden:
+        await log(member.guild, f"{member.name} に {role.name} を付与できません（権限不足）")
+    except Exception as e:
+        await log(member.guild, f"{member.name} に {role.name} を付与できません: {e}")
 
 # ====================== Bot イベント ======================
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    await bot.change_presence(
-        status=discord.Status.online,
-        activity=discord.Game("稼働中")
-    )
+    for guild in bot.guilds:
+        await log(guild, "Botがオンラインになりました")
+        # 既存「注意」「警告」ロールにタイムスタンプ補完
+        now = datetime.utcnow().timestamp()
+        for member in guild.members:
+            for role in member.roles:
+                if role.name in ROLES_TO_AUTO_REMOVE:
+                    guild_id = str(guild.id)
+                    user_id = str(member.id)
+                    if guild_id not in role_data:
+                        role_data[guild_id] = {}
+                    if user_id not in role_data[guild_id]:
+                        role_data[guild_id][user_id] = {}
+                    if role.name not in role_data[guild_id][user_id]:
+                        role_data[guild_id][user_id][role.name] = now
     check_roles.start()
 
 # ====================== コマンド ======================
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def giveall(ctx, role: discord.Role):
+    if not role:
+        await ctx.send("有効なロールを指定してください")
+        return
     msg = await ctx.send("処理を開始します...")
     failed = []
-    for member in ctx.guild.members:
-        try:
-            await add_role_with_timestamp(member, role)
-        except discord.Forbidden:
-            failed.append(member.name)
-        except discord.HTTPException:
-            failed.append(member.name)
-    text = f"{ctx.guild.member_count - len(failed)}人にロールを付与しました。"
+    members = list(ctx.guild.members)
+    for i in range(0, len(members), BATCH_SIZE):
+        batch = members[i:i+BATCH_SIZE]
+        for member in batch:
+            try:
+                await add_role_with_timestamp(member, role)
+            except Exception:
+                failed.append(member.name)
+        await asyncio.sleep(1)  # レート制限対策
+    text = f"{len(members) - len(failed)}人にロールを付与しました。"
     if failed:
         text += f"\n付与に失敗した人: {', '.join(failed)}"
     await msg.edit(content=text)
@@ -110,6 +191,9 @@ async def giveall(ctx, role: discord.Role):
 @commands.has_permissions(administrator=True)
 async def test_add(ctx, role: discord.Role):
     """デバッグ用: 自分にロール付与"""
+    if not role:
+        await ctx.send("有効なロールを指定してください")
+        return
     await add_role_with_timestamp(ctx.author, role)
     await ctx.send(f"{ctx.author.name} に {role.name} を付与しました（デバッグ用）")
 
