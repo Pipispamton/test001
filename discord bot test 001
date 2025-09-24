@@ -1,117 +1,972 @@
 # -*- coding: utf-8 -*-
 import discord
-from discord.ext import commands, tasks
+from discord.ext import tasks
+from discord import app_commands
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
+import asyncio
+import shutil
+import logging
+
+# ====================== ロギング設定 ======================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ====================== 設定 ======================
-DEBUG = True  # デバッグ用なら True、本番は False
+DEBUG = False
 
 if DEBUG:
-    CHECK_INTERVAL = 5         # チェック間隔（秒）
-    REMOVE_AFTER = 10          # 削除までの期間（秒）
+    CHECK_INTERVAL = 5        # チェック間隔（秒）
+    SYNC_INTERVAL = 10         # データ同期間隔（秒）- テスト用
+    REMOVE_AFTER = 15          # 削除までの期間（秒）- テスト用
+    BATCH_SIZE = 20            # バッチサイズを小さく（レート制限対策）
+    API_DELAY = 0.5           # API呼び出し間の待機時間
 else:
-    CHECK_INTERVAL = 60*60*2   # 2時間
+    CHECK_INTERVAL = 60*10     # 10分間隔でロール削除チェック
+    SYNC_INTERVAL = 60*60      # 1時間間隔でデータ同期
     REMOVE_AFTER = 60*60*24*30*3  # 3か月（秒）
+    BATCH_SIZE = 50
+    API_DELAY = 0.2
 
 ROLES_TO_AUTO_REMOVE = ["注意", "警告"]
 DATA_FILE = "roles_data.json"
-COMMAND_PREFIX = "!"
+BACKUP_DIR = "backup"
+LOG_CHANNEL_NAME = "bot-logs"
+LOG_CHANNEL_ID = None
 
 # ====================== Bot 初期化 ======================
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
-# ====================== データ操作 ======================
+class MyBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self._data_lock = asyncio.Lock()  # データの同時アクセス防止
+
+    async def setup_hook(self):
+        logger.info("Setting up bot...")
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Synced {len(synced)} commands globally")
+        except Exception as e:
+            logger.error(f"Failed to sync globally: {e}")
+
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                logger.info(f"Synced {len(synced)} commands to guild: {guild.name} (ID: {guild.id})")
+            except Exception as e:
+                logger.error(f"Failed to sync commands for guild {guild.name}: {e}")
+
+bot = MyBot()
+
+# ====================== データ操作（改善版） ======================
+
+def ensure_backup_dir():
+    """バックアップディレクトリの存在確保"""
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Failed to create backup directory: {e}")
+
+def backup_file():
+    """データファイルのバックアップ"""
+    ensure_backup_dir()
+    if not os.path.exists(DATA_FILE):
+        return
+    
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(BACKUP_DIR, f"roles_data_{timestamp}.json")
+    
+    try:
+        shutil.copy2(DATA_FILE, backup_path)
+        logger.info(f"Backup created: {backup_path}")
+        
+        # 古いバックアップファイルの削除（10個以上保持しない）
+        cleanup_old_backups()
+    except Exception as e:
+        logger.error(f"Backup failed: {e}")
+
+def cleanup_old_backups():
+    """古いバックアップファイルを削除"""
+    try:
+        if not os.path.exists(BACKUP_DIR):
+            return
+            
+        backups = [f for f in os.listdir(BACKUP_DIR) if f.startswith("roles_data_")]
+        backups.sort(reverse=True)
+        
+        # 10個以上ある場合、古いものを削除
+        for old_backup in backups[10:]:
+            old_path = os.path.join(BACKUP_DIR, old_backup)
+            os.remove(old_path)
+            logger.info(f"Removed old backup: {old_backup}")
+    except Exception as e:
+        logger.error(f"Failed to cleanup old backups: {e}")
+
 def load_data():
-    if os.path.exists(DATA_FILE):
+    """データファイルの読み込み（エラーハンドリング強化）"""
+    if not os.path.exists(DATA_FILE):
+        logger.info("Data file not found, initializing empty data")
+        return {}
+    
+    try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            logger.info("Data loaded successfully")
+            return data
+    except (json.JSONDecodeError, PermissionError) as e:
+        logger.error(f"Error loading {DATA_FILE}: {e}, attempting backup restore")
+        return restore_from_backup()
+
+def restore_from_backup():
+    """バックアップからの復元"""
+    if not os.path.exists(BACKUP_DIR):
+        logger.warning("No backup directory found")
+        return {}
+        
+    backups = [f for f in os.listdir(BACKUP_DIR) if f.startswith("roles_data_")]
+    backups.sort(reverse=True)
+    
+    for backup in backups:
+        backup_path = os.path.join(BACKUP_DIR, backup)
+        try:
+            with open(backup_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                logger.info(f"Restored from backup: {backup}")
+                return data
+        except Exception as e:
+            logger.error(f"Failed to restore from {backup}: {e}")
+            continue
+    
+    logger.warning("No valid backup found, initializing empty data")
     return {}
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+async def save_data(data):
+    """データ保存（非同期ロック付き）"""
+    async with bot._data_lock:
+        try:
+            backup_file()
+            # 一時ファイルに書き込んでから移動（原子性確保）
+            temp_file = f"{DATA_FILE}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            # 元のファイルを置換
+            if os.path.exists(DATA_FILE):
+                os.replace(temp_file, DATA_FILE)
+            else:
+                os.rename(temp_file, DATA_FILE)
+                
+            logger.debug("Data saved successfully")
+        except Exception as e:
+            logger.error(f"Failed to save {DATA_FILE}: {e}")
+            # 一時ファイルが残っている場合は削除
+            temp_file = f"{DATA_FILE}.tmp"
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
 
-role_data = load_data()  # {guild_id: {user_id: {role_name: timestamp}}}
+# データ初期化
+role_data = load_data()
 
-# ====================== 自動削除処理 ======================
+# ====================== ログ送信（改善版） ======================
+async def log_message(guild, message, level="info"):
+    """ログメッセージの送信（レベル指定可能）"""
+    try:
+        # チャンネル取得
+        channel = None
+        if LOG_CHANNEL_ID:
+            channel = guild.get_channel(LOG_CHANNEL_ID)
+        
+        if not channel and LOG_CHANNEL_NAME:
+            channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+        
+        # Discord へのログ送信
+        if channel:
+            # レベルに応じて絵文字を付ける
+            emoji_map = {
+                "info": "ℹ️",
+                "success": "✅",
+                "warning": "⚠️", 
+                "error": "❌"
+            }
+            emoji = emoji_map.get(level, "📝")
+            
+            # 長いメッセージは分割
+            if len(message) > 1800:
+                chunks = [message[i:i+1800] for i in range(0, len(message), 1800)]
+                for i, chunk in enumerate(chunks):
+                    if i == 0:
+                        await channel.send(f"{emoji} {chunk}")
+                    else:
+                        await channel.send(f"📄 (続き) {chunk}")
+            else:
+                await channel.send(f"{emoji} {message}")
+        else:
+            logger.warning(f"Log channel not found in guild {guild.name}")
+            
+    except discord.HTTPException as e:
+        if e.status == 429:  # Rate limit
+            logger.warning(f"Rate limited when logging to Discord: {e}")
+        else:
+            logger.error(f"Discord error when logging: {e}")
+    except Exception as e:
+        logger.error(f"Failed to log message to Discord: {e}")
+    
+    # コンソール/ファイルログ
+    log_text = f"[{guild.name}] {message}"
+    if level == "error":
+        logger.error(log_text)
+    elif level == "warning":
+        logger.warning(log_text)
+    else:
+        logger.info(log_text)
+
+# ====================== データ整合性チェック・修正（定期同期対応版） ======================
+async def sync_data_with_reality(guild, is_periodic=False):
+    """サーバーの実際の状態とデータを同期（不定期起動対応）"""
+    try:
+        now = datetime.utcnow().timestamp()
+        guild_id = str(guild.id)
+        
+        if guild_id not in role_data:
+            role_data[guild_id] = {}
+        
+        # 現在のロール保持者を取得
+        current_role_holders = {}
+        for member in guild.members:
+            if member.bot:
+                continue
+            
+            user_id = str(member.id)
+            for role in member.roles:
+                if role.name in ROLES_TO_AUTO_REMOVE:
+                    if user_id not in current_role_holders:
+                        current_role_holders[user_id] = []
+                    current_role_holders[user_id].append(role.name)
+        
+        changes_made = False
+        removed_count = 0
+        added_count = 0
+        
+        # データに記録されているが実際にはロールを持っていない人を削除
+        users_to_remove = []
+        for user_id, user_roles in list(role_data[guild_id].items()):
+            if user_id not in current_role_holders:
+                # ロールを全く持っていない場合
+                users_to_remove.append(user_id)
+                removed_count += len(user_roles)
+            else:
+                # 一部のロールがない場合
+                roles_to_remove = []
+                for role_name in list(user_roles.keys()):
+                    if role_name not in current_role_holders[user_id]:
+                        roles_to_remove.append(role_name)
+                        removed_count += 1
+                
+                for role_name in roles_to_remove:
+                    del role_data[guild_id][user_id][role_name]
+                    changes_made = True
+                
+                # 空になったユーザーデータを削除
+                if not role_data[guild_id][user_id]:
+                    users_to_remove.append(user_id)
+        
+        for user_id in users_to_remove:
+            del role_data[guild_id][user_id]
+            changes_made = True
+        
+        # 実際にロールを持っているがデータに記録されていない人を追加
+        for user_id, roles in current_role_holders.items():
+            if user_id not in role_data[guild_id]:
+                role_data[guild_id][user_id] = {}
+            
+            for role_name in roles:
+                if role_name not in role_data[guild_id][user_id]:
+                    # 現在時刻をタイムスタンプとして設定
+                    role_data[guild_id][user_id][role_name] = now
+                    changes_made = True
+                    added_count += 1
+        
+        if changes_made:
+            await save_data(role_data)
+            sync_type = "定期同期" if is_periodic else "起動時同期"
+            sync_msg = f"{sync_type}完了: 削除 {removed_count}件, 追加 {added_count}件"
+            logger.info(f"[{guild.name}] {sync_msg}")
+            
+            # 定期同期の場合は変更があった時のみDiscordログに送信
+            if is_periodic and (removed_count > 0 or added_count > 0):
+                await log_message(guild, sync_msg, "info")
+            elif not is_periodic:
+                await log_message(guild, sync_msg, "info")
+        else:
+            sync_type = "定期同期" if is_periodic else "起動時同期"
+            logger.info(f"[{guild.name}] {sync_type}: 変更なし")
+        
+        return {"removed": removed_count, "added": added_count}
+        
+    except Exception as e:
+        logger.error(f"Error syncing data for guild {guild.name}: {e}")
+        await log_message(guild, f"データ同期エラー: {e}", "error")
+        return {"removed": 0, "added": 0}
+
+# ====================== 自動削除処理（不定期起動対応版） ======================
+async def process_member_roles(guild, user_id, member_roles, now):
+    """メンバーの役職処理（不定期起動対応）"""
+    try:
+        member = guild.get_member(int(user_id))
+        if not member:
+            # メンバーが見つからない場合はデータから削除
+            guild_id = str(guild.id)
+            if guild_id in role_data and user_id in role_data[guild_id]:
+                del role_data[guild_id][user_id]
+                logger.info(f"Removed data for user {user_id} (not found in guild)")
+            return 0
+
+        guild_id = str(guild.id)
+        roles_to_remove = []
+        
+        for role_name, timestamp in list(member_roles.items()):
+            if role_name not in ROLES_TO_AUTO_REMOVE:
+                continue
+                
+            role = discord.utils.get(guild.roles, name=role_name)
+            if not role:
+                # ロールが存在しない場合はデータから削除
+                if guild_id in role_data and user_id in role_data[guild_id]:
+                    role_data[guild_id][user_id].pop(role_name, None)
+                    logger.info(f"Removed data for non-existent role {role_name}")
+                continue
+            
+            # メンバーが実際にロールを持っているかチェック
+            if role not in member.roles:
+                # データにはあるが実際にはロールがない場合（手動削除された）
+                if guild_id in role_data and user_id in role_data[guild_id]:
+                    role_data[guild_id][user_id].pop(role_name, None)
+                    logger.info(f"Removed data for manually removed role {role_name} from {member.name}")
+                continue
+            
+            # タイムスタンプがNoneの場合は現在時刻を設定
+            if timestamp is None:
+                role_data[guild_id][user_id][role_name] = now
+                logger.info(f"Set timestamp for {member.name}'s {role_name} role")
+                continue
+            
+            # 削除期間を過ぎている場合
+            if now - timestamp >= REMOVE_AFTER:
+                roles_to_remove.append((role, role_name))
+        
+        # ロール削除の実行
+        removed_count = 0
+        for role, role_name in roles_to_remove:
+            try:
+                await member.remove_roles(role, reason=f"自動削除（期間満了: {REMOVE_AFTER//86400}日経過）")
+                
+                # 削除日時の計算
+                assigned_time = datetime.fromtimestamp(member_roles[role_name])
+                days_passed = (now - member_roles[role_name]) // 86400
+                
+                log_msg = f"{member.display_name} から '{role_name}' を自動削除 (付与日: {assigned_time.strftime('%Y/%m/%d %H:%M')}, 経過日数: {int(days_passed)}日)"
+                await log_message(guild, log_msg, "success")
+                
+                # データから削除
+                if guild_id in role_data and user_id in role_data[guild_id]:
+                    role_data[guild_id][user_id].pop(role_name, None)
+                
+                removed_count += 1
+                    
+            except discord.Forbidden:
+                await log_message(guild, f"{member.display_name} から {role_name} の削除に失敗（権限不足）", "warning")
+            except discord.HTTPException as e:
+                if e.status == 429:  # Rate limit
+                    logger.warning(f"Rate limited removing role from {member}: {e}")
+                    await asyncio.sleep(2)
+                else:
+                    await log_message(guild, f"{member.display_name} から {role_name} の削除に失敗: HTTP {e.status}", "error")
+            except Exception as e:
+                await log_message(guild, f"{member.display_name} から {role_name} の削除でエラー: {e}", "error")
+
+        # 空のユーザーデータを削除
+        if (guild_id in role_data and user_id in role_data[guild_id] 
+            and not role_data[guild_id][user_id]):
+            del role_data[guild_id][user_id]
+        
+        return removed_count
+            
+    except Exception as e:
+        logger.error(f"Error processing member {user_id} in guild {guild.id}: {e}")
+        return 0
+
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def check_roles():
-    now = datetime.utcnow().timestamp()
-    for guild in bot.guilds:
-        g_id = str(guild.id)
-        if g_id not in role_data:
-            continue
-        for user_id, roles in list(role_data[g_id].items()):
-            member = guild.get_member(int(user_id))
-            if not member:
+    """定期的な役職チェック（不定期起動対応版）"""
+    try:
+        logger.info("Starting role check cycle")
+        now = datetime.utcnow().timestamp()
+        total_removed = 0
+        
+        for guild in bot.guilds:
+            guild_id = str(guild.id)
+            if guild_id not in role_data or not role_data[guild_id]:
                 continue
-            for role_name, ts in list(roles.items()):
-                if role_name not in ROLES_TO_AUTO_REMOVE:
-                    continue
-                if now - ts >= REMOVE_AFTER:
-                    role = discord.utils.get(guild.roles, name=role_name)
-                    if role and role in member.roles:
-                        try:
-                            await member.remove_roles(role)
-                            print(f"{member.name} から {role_name} を削除しました")
-                        except discord.Forbidden:
-                            print(f"{member.name} から {role_name} の削除に失敗しました（権限不足）")
-                    # 削除したのでデータも削除
-                    del role_data[g_id][user_id][role_name]
-            if not role_data[g_id][user_id]:
-                del role_data[g_id][user_id]
-    save_data(role_data)
+                
+            user_ids = list(role_data[guild_id].keys())
+            logger.info(f"Checking {len(user_ids)} users in guild {guild.name}")
+            
+            guild_removed = 0
+            
+            # バッチ処理
+            for i in range(0, len(user_ids), BATCH_SIZE):
+                batch = user_ids[i:i+BATCH_SIZE]
+                
+                # 逐次処理（レート制限対策）
+                for uid in batch:
+                    if uid in role_data[guild_id]:  # データが削除されていないか確認
+                        removed = await process_member_roles(guild, uid, role_data[guild_id][uid].copy(), now)
+                        guild_removed += removed
+                        await asyncio.sleep(0.1)  # 個別のAPI呼び出し間隔
+                
+                # バッチ間の待機時間
+                if i + BATCH_SIZE < len(user_ids):
+                    await asyncio.sleep(API_DELAY)
+            
+            total_removed += guild_removed
+            if guild_removed > 0:
+                logger.info(f"[{guild.name}] Removed {guild_removed} roles")
+        
+        # データ保存
+        await save_data(role_data)
+        
+        if total_removed > 0:
+            logger.info(f"Role check cycle completed - Total removed: {total_removed}")
+        else:
+            logger.info("Role check cycle completed - No roles removed")
+        
+    except Exception as e:
+        logger.error(f"Error in check_roles task: {e}")
 
-async def add_role_with_timestamp(member, role):
-    guild_id = str(member.guild.id)
-    user_id = str(member.id)
-    if guild_id not in role_data:
-        role_data[guild_id] = {}
-    if user_id not in role_data[guild_id]:
-        role_data[guild_id][user_id] = {}
-    role_data[guild_id][user_id][role.name] = datetime.utcnow().timestamp()
-    save_data(role_data)
-    await member.add_roles(role)
+@check_roles.before_loop
+async def before_check_roles():
+    """タスク開始前にBotの準備完了を待機"""
+    await bot.wait_until_ready()
+
+# ====================== 定期同期タスク ======================
+@tasks.loop(seconds=SYNC_INTERVAL)
+async def sync_data_periodically():
+    """定期的なデータ同期（1時間間隔）"""
+    try:
+        logger.info("Starting periodic data sync")
+        total_changes = {"removed": 0, "added": 0}
+        
+        for guild in bot.guilds:
+            try:
+                result = await sync_data_with_reality(guild, is_periodic=True)
+                total_changes["removed"] += result["removed"]
+                total_changes["added"] += result["added"]
+                
+                # サーバー間で少し待機
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error in periodic sync for guild {guild.name}: {e}")
+        
+        # データ保存
+        await save_data(role_data)
+        
+        if total_changes["removed"] > 0 or total_changes["added"] > 0:
+            logger.info(f"Periodic sync completed - Removed: {total_changes['removed']}, Added: {total_changes['added']}")
+        else:
+            logger.info("Periodic sync completed - No changes")
+        
+    except Exception as e:
+        logger.error(f"Error in periodic sync task: {e}")
+
+@sync_data_periodically.before_loop
+async def before_sync_data():
+    """同期タスク開始前にBotの準備完了を待機"""
+    await bot.wait_until_ready()
+
+# ====================== ロール管理関数（改善版） ======================
+async def add_role_with_timestamp(member, role, silent=False, reason=None):
+    """ロール付与（改善版）"""
+    try:
+        guild_id = str(member.guild.id)
+        user_id = str(member.id)
+        
+        # データ構造の初期化
+        if guild_id not in role_data:
+            role_data[guild_id] = {}
+        if user_id not in role_data[guild_id]:
+            role_data[guild_id][user_id] = {}
+        
+        # 既にロールを持っている場合はスキップ
+        if role in member.roles:
+            return True
+            
+        # タイムスタンプの記録（既存でない場合のみ）
+        if role.name not in role_data[guild_id][user_id]:
+            role_data[guild_id][user_id][role.name] = datetime.utcnow().timestamp()
+        
+        # ロール付与
+        audit_reason = reason or ("自動ロール付与（静音）" if silent else "自動ロール付与")
+        await member.add_roles(role, reason=audit_reason)
+        
+        await save_data(role_data)
+        return True
+        
+    except discord.Forbidden:
+        logger.error(f"Failed to add role {role.name} to {member}: Forbidden")
+        return False
+    except discord.HTTPException as e:
+        if e.status == 429:  # Rate limit
+            logger.warning(f"Rate limited adding role to {member}: {e}")
+            await asyncio.sleep(2)
+        else:
+            logger.error(f"HTTP error adding role {role.name} to {member}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error adding role {role.name} to {member}: {e}")
+        return False
 
 # ====================== Bot イベント ======================
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
-    await bot.change_presence(
-        status=discord.Status.online,
-        activity=discord.Game("稼働中")
-    )
-    check_roles.start()
+    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    logger.info(f"Connected to {len(bot.guilds)} guilds")
+    
+    try:
+        startup_time = datetime.utcnow()
+        
+        for guild in bot.guilds:
+            logger.info(f"Guild: {guild.name} (ID: {guild.id})")
+            startup_msg = f"Bot起動完了 ({startup_time.strftime('%Y/%m/%d %H:%M:%S')} UTC)"
+            await log_message(guild, startup_msg, "success")
+            
+            # データ同期（不定期起動対応の核心部分）
+            await sync_data_with_reality(guild, is_periodic=False)
+        
+        await save_data(role_data)
+        
+        # 定期タスク開始
+        if not check_roles.is_running():
+            check_roles.start()
+            logger.info("Role check task started")
+        
+        if not sync_data_periodically.is_running():
+            sync_data_periodically.start()
+            logger.info("Periodic data sync task started")
+            
+        logger.info("Bot is ready and data synchronized!")
+        
+        # 起動時に期間満了チェックを実行
+        logger.info("Performing startup role check...")
+        await check_roles.coro()
+        
+    except Exception as e:
+        logger.error(f"Error in on_ready: {e}")
 
-# ====================== コマンド ======================
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def giveall(ctx, role: discord.Role):
-    msg = await ctx.send("処理を開始します...")
-    failed = []
-    for member in ctx.guild.members:
+@bot.event
+async def on_error(event, *args, **kwargs):
+    logger.error(f"Discord event error in {event}: {args}", exc_info=True)
+
+# ====================== スラッシュコマンド ======================
+@bot.tree.command(name="giveall", description="全員に指定したロールを付与")
+@app_commands.describe(
+    role="付与するロール",
+    silent="静音モード（監査ログのみ変更、通知制御は限定的）"
+)
+async def giveall(interaction: discord.Interaction, role: discord.Role, silent: bool = False):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 管理者権限が必要です。", ephemeral=True)
+        return
+
+    # Bot自身の権限チェック
+    if not interaction.guild.me.guild_permissions.manage_roles:
+        await interaction.response.send_message("❌ Botにロール管理権限がありません。", ephemeral=True)
+        return
+    
+    # ロールの階層チェック
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message("❌ そのロールはBotの権限より上位のため付与できません。", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    
+    try:
+        members = [m for m in interaction.guild.members if not m.bot and role not in m.roles]
+        total_members = len(members)
+        
+        if total_members == 0:
+            await interaction.followup.send("✅ 全員が既に該当ロールを持っています。")
+            return
+        
+        progress_msg = await interaction.followup.send(
+            f"🔄 {role.name} を {total_members} 人に付与中... (0/{total_members})"
+        )
+        
+        success, failed = 0, 0
+        failed_members = []
+        
+        # バッチ処理
+        for i in range(0, len(members), BATCH_SIZE):
+            batch = members[i:i+BATCH_SIZE]
+            
+            for member in batch:
+                try:
+                    result = await add_role_with_timestamp(
+                        member, role, silent, 
+                        f"一括付与 by {interaction.user.display_name}"
+                    )
+                    if result:
+                        success += 1
+                    else:
+                        failed += 1
+                        failed_members.append(member.display_name)
+                except Exception as e:
+                    logger.error(f"Error in giveall for {member}: {e}")
+                    failed += 1
+                    failed_members.append(member.display_name)
+                    
+                # 個別の待機時間
+                await asyncio.sleep(0.1)
+            
+            # 進行状況更新
+            processed = success + failed
+            if processed % (BATCH_SIZE * 2) == 0 or processed == total_members:
+                try:
+                    await progress_msg.edit(
+                        content=f"🔄 {role.name} を付与中... ({processed}/{total_members})"
+                    )
+                except discord.NotFound:
+                    pass  # メッセージが削除された場合
+            
+            # バッチ間のレート制限対策
+            if i + BATCH_SIZE < len(members):
+                await asyncio.sleep(API_DELAY)
+        
+        # 結果報告
+        result_msg = f"✅ {role.name} の一括付与完了！\n"
+        result_msg += f"成功: {success}人 / 失敗: {failed}人"
+        
+        if silent:
+            result_msg += "\n🔇 静音モードで実行"
+        
+        if role.name in ROLES_TO_AUTO_REMOVE:
+            days = REMOVE_AFTER // 86400
+            result_msg += f"\n⏰ {days}日後に自動削除されます"
+        
+        if failed > 0:
+            if failed <= 5:
+                result_msg += f"\n❌ 失敗: {', '.join(failed_members)}"
+            else:
+                result_msg += f"\n❌ 失敗: {', '.join(failed_members[:3])} 他{failed-3}人"
+        
+        await progress_msg.edit(content=result_msg)
+        
+        # ログ記録
+        await log_message(
+            interaction.guild,
+            f"管理者 {interaction.user.display_name} が {role.name} を一括付与: 成功{success}人, 失敗{failed}人",
+            "success" if failed == 0 else "warning"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in giveall command: {e}")
         try:
-            await add_role_with_timestamp(member, role)
-        except discord.Forbidden:
-            failed.append(member.name)
-        except discord.HTTPException:
-            failed.append(member.name)
-    text = f"{ctx.guild.member_count - len(failed)}人にロールを付与しました。"
-    if failed:
-        text += f"\n付与に失敗した人: {', '.join(failed)}"
-    await msg.edit(content=text)
+            await interaction.followup.send(f"❌ 予期しないエラーが発生しました: {str(e)}")
+        except discord.NotFound:
+            pass
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def test_add(ctx, role: discord.Role):
-    """デバッグ用: 自分にロール付与"""
-    await add_role_with_timestamp(ctx.author, role)
-    await ctx.send(f"{ctx.author.name} に {role.name} を付与しました（デバッグ用）")
+@bot.tree.command(name="test_add", description="自分にロールを付与（テスト用）")
+@app_commands.describe(role="付与するロール", silent="静音モード")
+async def test_add(interaction: discord.Interaction, role: discord.Role, silent: bool = False):
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message("❌ そのロールは付与できません（権限不足）", ephemeral=True)
+        return
+    
+    try:
+        result = await add_role_with_timestamp(
+            interaction.user, role, silent, 
+            f"テストコマンド by {interaction.user.display_name}"
+        )
+        
+        if result:
+            msg = f"✅ {role.name} を付与しました"
+            if silent:
+                msg += "（静音モード）"
+            if role.name in ROLES_TO_AUTO_REMOVE:
+                days = REMOVE_AFTER // 86400
+                msg += f"\n⏰ {days}日後に自動削除されます"
+            await interaction.response.send_message(msg)
+            await log_message(interaction.guild, f"テスト: {interaction.user.display_name} に {role.name} を付与", "info")
+        else:
+            await interaction.response.send_message("❌ ロール付与に失敗しました", ephemeral=True)
+            
+    except Exception as e:
+        logger.error(f"Error in test_add: {e}")
+        await interaction.response.send_message(f"❌ エラー: {str(e)}", ephemeral=True)
 
-# ====================== Bot 実行 ======================
-bot.run("YOUR_TOKEN_HERE")
+@bot.tree.command(name="status", description="Botの状態を表示")
+async def status_command(interaction: discord.Interaction):
+    try:
+        guild_id = str(interaction.guild.id)
+        tracked_users = len(role_data.get(guild_id, {}))
+        
+        # ロール別の統計
+        role_stats = {}
+        expiring_soon = {"注意": 0, "警告": 0}
+        now = datetime.utcnow().timestamp()
+        
+        if guild_id in role_data:
+            for user_data in role_data[guild_id].values():
+                for role_name, timestamp in user_data.items():
+                    role_stats[role_name] = role_stats.get(role_name, 0) + 1
+                    
+                    # 残り時間が1週間以内の場合をカウント
+                    if timestamp and role_name in expiring_soon:
+                        time_remaining = REMOVE_AFTER - (now - timestamp)
+                        if 0 < time_remaining <= 604800:  # 1週間 = 604800秒
+                            expiring_soon[role_name] += 1
+        
+        embed = discord.Embed(title="Bot ステータス", color=0x00ff00)
+        embed.add_field(name="追跡中ユーザー", value=f"{tracked_users}人", inline=True)
+        embed.add_field(name="ロール削除チェック間隔", value=f"{CHECK_INTERVAL//60}分", inline=True)
+        embed.add_field(name="データ同期間隔", value=f"{SYNC_INTERVAL//60}分", inline=True)
+        embed.add_field(name="自動削除期間", value=f"{REMOVE_AFTER//86400}日", inline=True)
+        
+        if role_stats:
+            stats_text = ""
+            for role, count in role_stats.items():
+                stats_text += f"{role}: {count}人"
+                if role in expiring_soon and expiring_soon[role] > 0:
+                    stats_text += f" (うち1週間以内削除: {expiring_soon[role]}人)"
+                stats_text += "\n"
+            embed.add_field(name="ロール別統計", value=stats_text.strip(), inline=False)
+        
+        # 起動モード説明
+        embed.add_field(
+            name="⚙️ 動作モード", 
+            value="不定期起動対応\n• 起動時にデータ同期\n• 定期的データ同期\n• 定期チェックで自動削除", 
+            inline=False
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error in status command: {e}")
+        await interaction.response.send_message("❌ ステータス取得に失敗しました", ephemeral=True)
+
+@bot.tree.command(name="sync_check", description="データ同期とロール削除チェックを手動実行（管理者限定）")
+async def sync_check(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 管理者権限が必要です。", ephemeral=True)
+        return
+    
+    await interaction.response.defer(thinking=True)
+    
+    try:
+        # データ同期
+        await sync_data_with_reality(interaction.guild, is_periodic=False)
+        
+        # ロール削除チェック
+        now = datetime.utcnow().timestamp()
+        guild_id = str(interaction.guild.id)
+        
+        if guild_id not in role_data or not role_data[guild_id]:
+            await interaction.followup.send("✅ 同期完了。追跡中のユーザーはいません。")
+            return
+        
+        user_ids = list(role_data[guild_id].keys())
+        total_removed = 0
+        
+        for uid in user_ids:
+            if uid in role_data[guild_id]:
+                removed = await process_member_roles(interaction.guild, uid, role_data[guild_id][uid].copy(), now)
+                total_removed += removed
+                await asyncio.sleep(0.1)
+        
+        await save_data(role_data)
+        
+        result_msg = f"✅ 手動同期・チェック完了\n"
+        result_msg += f"削除されたロール数: {total_removed}"
+        
+        await interaction.followup.send(result_msg)
+        await log_message(interaction.guild, f"管理者 {interaction.user.display_name} が手動同期・チェックを実行: {total_removed}個削除", "info")
+        
+    except Exception as e:
+        logger.error(f"Error in sync_check command: {e}")
+        await interaction.followup.send(f"❌ エラーが発生しました: {str(e)}")
+
+@bot.tree.command(name="list_expiring", description="期限切れ間近のロールを表示（管理者限定）")
+@app_commands.describe(days="何日以内に期限切れするかを指定（デフォルト: 7日）")
+async def list_expiring(interaction: discord.Interaction, days: int = 7):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 管理者権限が必要です。", ephemeral=True)
+        return
+    
+    if days < 1 or days > 90:
+        await interaction.response.send_message("❌ 日数は1-90の範囲で指定してください。", ephemeral=True)
+        return
+    
+    try:
+        guild_id = str(interaction.guild.id)
+        now = datetime.utcnow().timestamp()
+        expiring_users = []
+        
+        if guild_id in role_data:
+            for user_id, user_roles in role_data[guild_id].items():
+                member = interaction.guild.get_member(int(user_id))
+                if not member:
+                    continue
+                
+                for role_name, timestamp in user_roles.items():
+                    if timestamp and role_name in ROLES_TO_AUTO_REMOVE:
+                        time_remaining = REMOVE_AFTER - (now - timestamp)
+                        days_remaining = time_remaining / 86400
+                        
+                        if 0 < days_remaining <= days:
+                            assigned_date = datetime.fromtimestamp(timestamp)
+                            expiring_users.append({
+                                'member': member.display_name,
+                                'role': role_name,
+                                'days_remaining': int(days_remaining),
+                                'assigned_date': assigned_date.strftime('%Y/%m/%d')
+                            })
+        
+        if not expiring_users:
+            await interaction.response.send_message(f"✅ {days}日以内に期限切れするロールはありません。")
+            return
+        
+        # 残り日数でソート
+        expiring_users.sort(key=lambda x: x['days_remaining'])
+        
+        embed = discord.Embed(title=f"期限切れ間近のロール（{days}日以内）", color=0xffaa00)
+        
+        description = ""
+        for user in expiring_users[:20]:  # 最大20件表示
+            description += f"• **{user['member']}** - {user['role']} "
+            description += f"(残り{user['days_remaining']}日, 付与日: {user['assigned_date']})\n"
+        
+        if len(expiring_users) > 20:
+            description += f"\n... 他{len(expiring_users) - 20}件"
+        
+        embed.description = description
+        embed.set_footer(text=f"合計: {len(expiring_users)}件")
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error in list_expiring command: {e}")
+        await interaction.response.send_message("❌ エラーが発生しました", ephemeral=True)
+
+@bot.tree.command(name="help", description="コマンド一覧を表示")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(title="🤖 コマンド一覧", color=0x0099ff)
+    
+    embed.add_field(
+        name="/giveall <ロール> [静音]", 
+        value="全員に指定ロールを付与\n管理者限定", 
+        inline=False
+    )
+    embed.add_field(
+        name="/test_add <ロール> [静音]", 
+        value="自分にロール付与（テスト用）", 
+        inline=False
+    )
+    embed.add_field(
+        name="/status", 
+        value="Botの状態と統計を表示", 
+        inline=False
+    )
+    embed.add_field(
+        name="/sync_check", 
+        value="データ同期と削除チェックを手動実行\n管理者限定", 
+        inline=False
+    )
+    embed.add_field(
+        name="/list_expiring [日数]", 
+        value="期限切れ間近のロール一覧表示\n管理者限定", 
+        inline=False
+    )
+    embed.add_field(
+        name="/help", 
+        value="このヘルプを表示", 
+        inline=False
+    )
+    
+    # 設定情報
+    log_info = "未設定"
+    if LOG_CHANNEL_ID:
+        channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
+        log_info = f"#{channel.name}" if channel else f"ID:{LOG_CHANNEL_ID}(不明)"
+    elif LOG_CHANNEL_NAME:
+        channel = discord.utils.get(interaction.guild.text_channels, name=LOG_CHANNEL_NAME)
+        log_info = f"#{LOG_CHANNEL_NAME} {'✅' if channel else '❌'}"
+    
+    embed.add_field(name="📝 ログチャンネル", value=log_info, inline=True)
+    embed.add_field(name="⏱️ 削除チェック間隔", value=f"{CHECK_INTERVAL//60}分", inline=True)
+    embed.add_field(name="🔄 データ同期間隔", value=f"{SYNC_INTERVAL//60}分", inline=True)
+    embed.add_field(name="🗑️ 自動削除期間", value=f"{REMOVE_AFTER//86400}日", inline=True)
+    
+    embed.add_field(
+        name="⚠️ 重要事項",
+        value=f"• 不定期起動対応（起動時+定期データ同期）\n• 自動削除対象: {', '.join(ROLES_TO_AUTO_REMOVE)}\n• 手動削除されたロールも自動検出",
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed)
+
+# ====================== エラーハンドラー ======================
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 必要な権限がありません。", ephemeral=True)
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(f"❌ コマンドはクールダウン中です。{error.retry_after:.1f}秒後に再試行してください。", ephemeral=True)
+    else:
+        logger.error(f"Application command error: {error}", exc_info=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message("❌ 予期しないエラーが発生しました。", ephemeral=True)
+
+# ====================== Bot実行 ======================
+# ⭐ トークンの設定方法：
+# 方法1: 環境変数で設定（推奨）
+#   Windows: set BOT_TOKEN=YOUR_BOT_TOKEN
+#   Mac/Linux: export BOT_TOKEN=YOUR_BOT_TOKEN
+#
+# 方法2: 下の行のコメントアウトを外して直接設定（非推奨）
+# TOKEN = "YOUR_BOT_TOKEN_HERE"
+
+TOKEN = os.environ.get("BOT_TOKEN")
+
+if __name__ == "__main__":
+    if not TOKEN:
+        logger.error("BOT_TOKEN environment variable is not set")
+        logger.error("トークンを設定してください:")
+        logger.error("  Windows: set BOT_TOKEN=あなたのトークン")
+        logger.error("  Mac/Linux: export BOT_TOKEN=あなたのトークン")
+        exit(1)
+    
+    try:
+        logger.info("Starting bot...")
+        bot.run(TOKEN)
+    except discord.LoginFailure:
+        logger.error("Invalid bot token")
+        exit(1)
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        exit(1)
