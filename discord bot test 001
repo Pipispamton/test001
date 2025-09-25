@@ -11,7 +11,7 @@ import functools
 from datetime import datetime, timezone, timedelta
 from discord.ui import Modal, TextInput, View, Button
 
-DEBUG = False
+DEBUG = True
 
 DATA_FILE = "roles_data.json"
 SETTINGS_FILE = "bot_settings_debug.json" if DEBUG else "bot_settings.json"
@@ -788,7 +788,7 @@ async def help_command(interaction: discord.Interaction):
             "\n• ページネーション対応（各ロール5件ずつ表示）"
             "\n• 理由編集後の自動更新機能"
             "\n• ログ送信先チャンネルをサーバーごとに設定可能"
-            "\n• `/message` で好きなメッセージを任意のチャンネルに投稿可能（管理者権限不要）"
+            "\n• `/message` で好きなメッセージを任意のチャンネルに投稿可能"
             "\n   例: `/message Hello world! general`"
         ),
         inline=False
