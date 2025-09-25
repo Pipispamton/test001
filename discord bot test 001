@@ -545,7 +545,7 @@ class RoleHistoryView(View):
         for item in self.children:
             item.disabled = True
 
-@bot.tree.command(name="show_role_history", description="指定ユーザーのロール付与履歴表示（注意・警告のみ、ページネーション・理由編集機能付き）")
+@bot.tree.command(name="show_role_history", description="指定ユーザーのロール付与履歴表示（注意・警告のみ。理由編集機能付き）")
 @app_commands.describe(user="履歴を表示したいユーザー（省略時は自分）")
 async def show_role_history(interaction: discord.Interaction, user: discord.Member = None):
     user = user or interaction.user
@@ -563,7 +563,7 @@ async def show_role_history(interaction: discord.Interaction, user: discord.Memb
     embed = view.create_embed()
     await interaction.response.send_message(embed=embed, view=view)
 
-@bot.tree.command(name="giveall", description="全員に指定ロールを付与")
+@bot.tree.command(name="giveall", description="全員に指定ロールを付与（管理者限定）")
 @app_commands.describe(role="付与するロール")
 async def giveall(interaction: discord.Interaction, role: discord.Role):
     if not interaction.user.guild_permissions.administrator:
