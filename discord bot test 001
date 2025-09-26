@@ -105,7 +105,15 @@ class DataManager:
 
     async def save_all(self):
         async with self._lock:
-            self._backup_data()
+            changed = False
+            # 変更検知: 保存前後でデータが変わった場合のみバックアップ
+            old_data = self._load_json(DATA_FILE, {})
+            old_settings = self._load_json(SETTINGS_FILE, {})
+            old_history = self._load_json(ROLE_HISTORY_FILE, {})
+            old_log = self._load_json(LOG_CHANNEL_FILE, {})
+            if old_data != self.role_data or old_settings != self.settings or old_history != self.role_add_history or old_log != self.guild_log_channels:
+                self._backup_data()
+                changed = True
             self._save_json(DATA_FILE, self.role_data)
             self._save_json(SETTINGS_FILE, self.settings)
             self._save_json(ROLE_HISTORY_FILE, self.role_add_history)
@@ -113,16 +121,34 @@ class DataManager:
 
     def _backup_data(self):
         os.makedirs(BACKUP_DIR, exist_ok=True)
-        if os.path.exists(DATA_FILE):
-            ts = now_jst().strftime("%Y%m%d_%H%M%S")
-            shutil.copy2(DATA_FILE, os.path.join(BACKUP_DIR, f"roles_data_{ts}.json"))
-            self._cleanup_old_backups()
+        ts = now_jst().strftime("%Y%m%d_%H%M%S")
+        backup_targets = [
+            (DATA_FILE, f"roles_data_{ts}.json"),
+            (SETTINGS_FILE, f"settings_{ts}.json"),
+            (ROLE_HISTORY_FILE, f"role_history_{ts}.json"),
+            (LOG_CHANNEL_FILE, f"log_channel_{ts}.json"),
+        ]
+        for src, dst in backup_targets:
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(BACKUP_DIR, dst))
+        self._cleanup_old_backups()
 
     def _cleanup_old_backups(self):
         try:
-            backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("roles_data_")], reverse=True)
-            for old_backup in backups[10:]:
-                os.remove(os.path.join(BACKUP_DIR, old_backup))
+            # roles_data, settings, role_history, log_channel それぞれ10世代まで残す
+            patterns = [
+                "roles_data_",
+                "settings_",
+                "role_history_",
+                "log_channel_",
+            ]
+            for pat in patterns:
+                backups = sorted(
+                    [f for f in os.listdir(BACKUP_DIR) if f.startswith(pat)],
+                    reverse=True
+                )
+                for old_backup in backups[10:]:
+                    os.remove(os.path.join(BACKUP_DIR, old_backup))
         except Exception as e:
             logger.error(f"Backup cleanup error: {e}")
 
@@ -234,13 +260,16 @@ async def sync_data_with_reality(guild, is_periodic=False):
         guild_id = str(guild.id)
         bot.data.role_data.setdefault(guild_id, {})
         current_holders = {}
+        # set型で高速化
+        auto_roles_set = set(ROLES_TO_AUTO_REMOVE)
         for member in guild.members:
             if member.bot:
                 continue
             user_id = str(member.id)
-            for role in member.roles:
-                if role.name in ROLES_TO_AUTO_REMOVE:
-                    current_holders.setdefault(user_id, []).append(role.name)
+            member_roles = set(r.name for r in member.roles)
+            target_roles = auto_roles_set & member_roles
+            if target_roles:
+                current_holders[user_id] = list(target_roles)
         changes = {"removed": 0, "added": 0}
         users_to_remove = []
         for user_id, user_roles in list(bot.data.role_data[guild_id].items()):
@@ -279,11 +308,13 @@ async def process_role_removal(guild):
         return 0
     now = now_jst().timestamp()
     total_removed = 0
+    changed = False
     async with bot.removal_lock:
         for user_id, user_roles in list(bot.data.role_data[guild_id].items()):
             member = guild.get_member(int(user_id))
             if not member:
                 del bot.data.role_data[guild_id][user_id]
+                changed = True
                 continue
             roles_to_remove = []
             for role_name, timestamp in list(user_roles.items()):
@@ -292,6 +323,7 @@ async def process_role_removal(guild):
                 role = discord.utils.get(guild.roles, name=role_name)
                 if not role or role not in member.roles:
                     bot.data.role_data[guild_id][user_id].pop(role_name, None)
+                    changed = True
                     continue
                 remove_seconds = bot.data.get_remove_seconds(guild_id, user_id, role_name)
                 if now - timestamp >= remove_seconds:
@@ -311,12 +343,15 @@ async def process_role_removal(guild):
                     )
                     bot.data.role_data[guild_id][user_id].pop(role_name, None)
                     total_removed += 1
-                    await bot.data.save_all()
+                    changed = True
                     await asyncio.sleep(0.1)
                 except Exception as e:
                     logger.error(f"Role removal error for {member}: {e}")
             if not bot.data.role_data[guild_id][user_id]:
                 del bot.data.role_data[guild_id][user_id]
+                changed = True
+    if changed:
+        await bot.data.save_all()
     return total_removed
 
 @tasks.loop(seconds=CHECK_INTERVAL)
@@ -403,6 +438,12 @@ class ReasonModal(Modal, title="理由を編集"):
                 ephemeral=True
             )
             await self.view_instance.update_view(interaction.message)
+            # ログ送信
+            guild = interaction.guild
+            user = guild.get_member(int(self.user_id)) if guild else None
+            user_name = user.display_name if user else self.user_id
+            log_msg = f"{interaction.user.display_name} が {user_name} の '{self.role_name} {self.index+1}回目' 理由を編集: {reason or '(理由なし)'}"
+            await log_message(guild, log_msg, "info")
         else:
             await interaction.response.send_message("❌ 理由の更新に失敗しました", ephemeral=True)
 
@@ -462,7 +503,7 @@ class RoleHistoryView(View):
     def get_current_page_data(self):
         page_data = {}
         for role_name, items in self.history.items():
-            sorted_items = sorted(items, key=lambda x: x['timestamp'], reverse=True)
+            sorted_items = sorted(enumerate(items), key=lambda x: x[1]['timestamp'], reverse=True)
             start_idx = self.current_page * self.items_per_role_per_page
             end_idx = start_idx + self.items_per_role_per_page
             page_items = sorted_items[start_idx:end_idx] if start_idx < len(sorted_items) else []
@@ -470,10 +511,10 @@ class RoleHistoryView(View):
                 page_items_with_index = [
                     {
                         'item': item,
-                        'original_index': items.index(item),
-                        'display_number': items.index(item) + 1
+                        'original_index': idx,
+                        'display_number': idx + 1
                     }
-                    for item in page_items
+                    for idx, item in page_items
                 ]
                 page_data[role_name] = {
                     'items': page_items_with_index,
@@ -557,25 +598,26 @@ async def show_role_history(interaction: discord.Interaction, user: discord.Memb
             description="履歴がありません。",
             color=0x0099ff
         )
-        await interaction.response.send_message(embed=embed)
+        await send_success(interaction, embed)
         return
     view = RoleHistoryView(guild_id, user_id, user.display_name, history)
     embed = view.create_embed()
-    await interaction.response.send_message(embed=embed, view=view)
+    await send_success(interaction, embed)
+    await interaction.response.edit_message(embed=embed, view=view)
 
 @bot.tree.command(name="giveall", description="全員に指定ロールを付与（管理者限定）")
 @app_commands.describe(role="付与するロール")
 async def giveall(interaction: discord.Interaction, role: discord.Role):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ 管理者権限が必要です。", ephemeral=True)
+    if not is_admin(interaction.user):
+        await send_error(interaction, "❌ 管理者権限が必要です。")
         return
     if role >= interaction.guild.me.top_role:
-        await interaction.response.send_message("❌ そのロールは付与できません", ephemeral=True)
+        await send_error(interaction, "❌ そのロールは付与できません")
         return
     await interaction.response.defer(thinking=True)
     members = [m for m in interaction.guild.members if not m.bot and role not in m.roles]
     if not members:
-        await interaction.followup.send("✅ 全員が既にロールを持っています。")
+        await send_success(interaction, "✅ 全員が既にロールを持っています。")
         return
     progress_msg = await interaction.followup.send(f"🔄 {role.name} を {len(members)} 人に付与中...")
     success = 0
@@ -598,10 +640,10 @@ async def giveall(interaction: discord.Interaction, role: discord.Role):
 @app_commands.describe(role="付与するロール")
 async def test_add(interaction: discord.Interaction, role: discord.Role):
     if role >= interaction.guild.me.top_role:
-        await interaction.response.send_message("❌ そのロールは付与できません", ephemeral=True)
+        await send_error(interaction, f"❌ そのロールは付与できません")
         return
     if role in interaction.user.roles:
-        await interaction.response.send_message(f"ℹ️ 既に {role.name} を持っています", ephemeral=True)
+        await send_error(interaction, f"ℹ️ 既に {role.name} を持っています")
         return
     result = await add_role_with_timestamp(interaction.user, role, "テストコマンド")
     if result:
@@ -609,29 +651,13 @@ async def test_add(interaction: discord.Interaction, role: discord.Role):
         if role.name in ROLES_TO_AUTO_REMOVE:
             seconds = bot.data.get_remove_seconds(str(interaction.guild.id), str(interaction.user.id), role.name)
             msg += f"\n⏰ {format_duration(seconds)}後に自動削除"
-        await interaction.response.send_message(msg)
+        await send_success(interaction, msg)
     else:
-        await interaction.response.send_message("❌ 付与に失敗しました", ephemeral=True)
-
-@bot.tree.command(name="status", description="Bot状態表示")
-async def status(interaction: discord.Interaction):
-    guild_id = str(interaction.guild.id)
-    tracked = len(bot.data.role_data.get(guild_id, {}))
-    embed = await create_embed(
-        "Bot ステータス", 0x00ff00,
-        追跡中ユーザー=f"{tracked}人",
-        チェック間隔=f"{CHECK_INTERVAL//60}分",
-        同期間隔=f"{SYNC_INTERVAL//60}分",
-        タイムゾーン="日本時間 (JST)"
-    )
-    remove_info = [f"{role}: {format_duration(bot.data.settings['remove_seconds'].get(role, DEFAULT_REMOVE_SECONDS[role]))}" for role in ROLES_TO_AUTO_REMOVE]
-    embed.add_field(name="自動削除期間", value="\n".join(remove_info), inline=False)
-    await interaction.response.send_message(embed=embed)
+        await send_error(interaction, "❌ 付与に失敗しました")
 
 @bot.tree.command(name="set_remove_period", description="デフォルト削除期間設定（管理者限定）")
 @app_commands.describe(role="ロール名", days="日", hours="時間", minutes="分", seconds="秒")
 @app_commands.choices(role=[app_commands.Choice(name=r, value=r) for r in ROLES_TO_AUTO_REMOVE])
-@admin_required
 async def set_remove_period(
     interaction: discord.Interaction,
     role: str,
@@ -640,9 +666,12 @@ async def set_remove_period(
     minutes: int = 0,
     seconds: int = 0
 ):
+    if not is_admin(interaction.user):
+        await send_error(interaction, "❌ 管理者権限が必要です。")
+        return
     total_seconds = parse_duration(days, hours, minutes, seconds)
     if total_seconds < 0:
-        await interaction.response.send_message("❌ 期間は0以上で指定してください", ephemeral=True)
+        await send_error(interaction, "❌ 期間は0以上で指定してください")
         return
     old_seconds = bot.data.settings["remove_seconds"].get(role, DEFAULT_REMOVE_SECONDS[role])
     bot.data.settings["remove_seconds"][role] = total_seconds
@@ -653,13 +682,12 @@ async def set_remove_period(
         変更前=format_duration(old_seconds),
         変更後=format_duration(total_seconds)
     )
-    await interaction.response.send_message(embed=embed)
+    await send_success(interaction, embed)
     await log_message(interaction.guild, f"{interaction.user.display_name} が '{role}' 期間を {format_duration(old_seconds)}→{format_duration(total_seconds)}に変更", "info")
 
 @bot.tree.command(name="set_user_period", description="個人削除期間設定（管理者限定）")
 @app_commands.describe(user="対象ユーザー", role="ロール名", days="日", hours="時間", minutes="分", seconds="秒")
 @app_commands.choices(role=[app_commands.Choice(name=r, value=r) for r in ROLES_TO_AUTO_REMOVE])
-@admin_required
 async def set_user_period(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -669,6 +697,9 @@ async def set_user_period(
     minutes: int = 0,
     seconds: int = 0
 ):
+    if not is_admin(interaction.user):
+        await send_error(interaction, "❌ 管理者権限が必要です。")
+        return
     total_seconds = parse_duration(days, hours, minutes, seconds)
     guild_id, user_id = str(interaction.guild.id), str(user.id)
     current_seconds = bot.data.get_remove_seconds(guild_id, user_id, role)
@@ -677,14 +708,17 @@ async def set_user_period(
         removed = bot.data.remove_user_setting(guild_id, user_id, role)
         title = "✅ 個人設定削除完了" if removed else "ℹ️ 個人設定なし"
         change = f"{format_duration(current_seconds)} → デフォルト({format_duration(default_seconds)})" if removed else "変更なし"
+        log_msg = f"{interaction.user.display_name} が {user.display_name} の '{role}' 個人削除期間設定を削除 ({format_duration(current_seconds)} → デフォルト)"
     else:
         bot.data.set_user_remove_seconds(guild_id, user_id, role, total_seconds)
         title = "✅ 個人削除期間設定完了"
         change = f"{format_duration(current_seconds)} → {format_duration(total_seconds)}"
+        log_msg = f"{interaction.user.display_name} が {user.display_name} の '{role}' 個人削除期間設定を変更 ({format_duration(current_seconds)} → {format_duration(total_seconds)})"
     await bot.data.save_all()
     embed = await create_embed(title, 0x00ff00,
                               ユーザー=user.display_name, ロール=role, 変更=change)
-    await interaction.response.send_message(embed=embed)
+    await send_success(interaction, embed)
+    await log_message(interaction.guild, log_msg, "info")
 
 @bot.tree.command(name="show_user_period", description="個人削除期間表示")
 @app_commands.describe(user="対象ユーザー（省略時は自分）")
@@ -700,16 +734,18 @@ async def show_user_period(interaction: discord.Interaction, user: discord.Membe
             if personal_seconds else f"{format_duration(default_seconds)} (デフォルト)"
         )
         embed.add_field(name=role_name, value=value, inline=True)
-    await interaction.response.send_message(embed=embed)
+    await send_success(interaction, embed)
 
 @bot.tree.command(name="sync_check", description="手動同期・チェック実行（管理者限定）")
-@admin_required
 async def sync_check(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await send_error(interaction, "❌ 管理者権限が必要です。")
+        return
     await interaction.response.defer(thinking=True)
     await sync_data_with_reality(interaction.guild)
     removed = await process_role_removal(interaction.guild)
     await bot.data.save_all()
-    await interaction.followup.send(f"✅ 手動同期完了\n削除されたロール: {removed}個")
+    await send_success(interaction, f"✅ 手動同期完了\n削除されたロール: {removed}個")
     await log_message(interaction.guild, f"{interaction.user.display_name} が手動同期実行: {removed}個削除", "info")
 
 @bot.tree.command(name="set_log_channel", description="このチャンネルをログ送信先に設定（管理者限定）")
@@ -717,7 +753,9 @@ async def sync_check(interaction: discord.Interaction):
 async def set_log_channel(interaction: discord.Interaction):
     bot.data.guild_log_channels[str(interaction.guild.id)] = interaction.channel.id
     await bot.data.save_all()
-    await interaction.response.send_message(f"✅ ログ送信先を {interaction.channel.mention} に設定しました", ephemeral=True)
+    await send_success(interaction, f"✅ ログ送信先を {interaction.channel.mention} に設定しました")
+    # ログ送信
+    await log_message(interaction.guild, f"{interaction.user.display_name} がログ送信先を {interaction.channel.mention} に変更", "info")
 
 @bot.tree.command(name="message", description="指定したチャンネルにメッセージを送信")
 @app_commands.describe(
@@ -767,14 +805,14 @@ async def help_command(interaction: discord.Interaction):
     commands_info = {
         "/giveall": "全員にロール付与（管理者限定）",
         "/test_add": "自分にロール付与（テスト用）",
-        "/status": "Bot状態表示",
         "/set_remove_period": "デフォルト削除期間設定（管理者限定）",
         "/set_user_period": "個人削除期間設定（管理者限定）",
         "/show_user_period": "個人削除期間表示",
         "/show_role_history": "ロール付与履歴表示（注意・警告のみ。理由編集機能付き）",
         "/sync_check": "手動同期・チェック（管理者限定）",
         "/set_log_channel": "このチャンネルをログ送信先に設定（管理者限定）",
-        "/message": "指定したチャンネルにメッセージ送信"
+        "/message": "指定したチャンネルにメッセージ送信",
+        "/show_settings": "Botの設定情報を表示（管理者限定）"
     }
     for cmd, desc in commands_info.items():
         embed.add_field(name=cmd, value=desc, inline=False)
@@ -790,16 +828,74 @@ async def help_command(interaction: discord.Interaction):
             "\n• ログ送信先チャンネルをサーバーごとに設定可能"
             "\n• `/message` で好きなメッセージを任意のチャンネルに投稿可能"
             "\n   例: `/message Hello world! general`"
+            "\n• `/show_settings` でBotの全設定を確認可能"
         ),
         inline=False
     )
-    await interaction.response.send_message(embed=embed)
+    await send_success(interaction, embed)
+
+@bot.tree.command(name="show_settings", description="Botの設定情報を表示（管理者限定）")
+async def show_settings(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await send_error(interaction, "❌ 管理者権限が必要です。")
+        return
+    guild_id = str(interaction.guild.id)
+    # ログ送信先チャンネル
+    log_channel_id = bot.data.guild_log_channels.get(guild_id)
+    log_channel = interaction.guild.get_channel(log_channel_id) if log_channel_id else None
+    log_channel_str = f"{log_channel.mention} (ID: {log_channel_id})" if log_channel else "未設定"
+    # 自動削除対象ロールと期間
+    auto_remove_info = []
+    for role in ROLES_TO_AUTO_REMOVE:
+        seconds = bot.data.settings["remove_seconds"].get(role, DEFAULT_REMOVE_SECONDS[role])
+        auto_remove_info.append(f"{role}: {format_duration(seconds)}")
+    # 個人削除期間設定の件数とユーザー名
+    user_settings = bot.data.settings.get("user_remove_seconds", {}).get(guild_id, {})
+    user_list = []
+    for user_id in user_settings.keys():
+        member = interaction.guild.get_member(int(user_id))
+        name = member.display_name if member else f"ID:{user_id}"
+        user_list.append(name)
+    user_settings_str = f"{len(user_list)}件: " + ", ".join(user_list) if user_list else "0件"
+    # DEBUGモード
+    debug_str = "ON" if DEBUG else "OFF"
+    # 追跡中ユーザー数
+    tracked = len(bot.data.role_data.get(guild_id, {}))
+    # チェック間隔・同期間隔・タイムゾーン
+    check_str = f"{CHECK_INTERVAL//60}分"
+    sync_str = f"{SYNC_INTERVAL//60}分"
+    tz_str = "日本時間 (JST)"
+    embed = discord.Embed(title="🔧 Bot設定情報", color=0x00ff00)
+    embed.add_field(name="ログ送信先チャンネル", value=log_channel_str, inline=False)
+    embed.add_field(name="自動削除対象ロールと期間", value="\n".join(auto_remove_info), inline=False)
+    embed.add_field(name="個人削除期間設定", value=user_settings_str, inline=False)
+    embed.add_field(name="DEBUGモード", value=debug_str, inline=True)
+    embed.add_field(name="追跡中ユーザー数", value=f"{tracked}人", inline=True)
+    embed.add_field(name="チェック間隔", value=check_str, inline=True)
+    embed.add_field(name="同期間隔", value=sync_str, inline=True)
+    embed.add_field(name="タイムゾーン", value=tz_str, inline=True)
+    await send_success(interaction, embed)
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     logger.error(f"Application command error: {error}", exc_info=True)
     if not interaction.response.is_done():
         await interaction.response.send_message("❌ 予期しないエラーが発生しました。", ephemeral=True)
+
+def is_admin(user):
+    return getattr(user.guild_permissions, "administrator", False)
+
+def send_error(interaction, msg):
+    if isinstance(msg, discord.Embed):
+        return interaction.response.send_message(embed=msg, ephemeral=True)
+    else:
+        return interaction.response.send_message(content=msg, ephemeral=True)
+
+def send_success(interaction, msg):
+    if isinstance(msg, discord.Embed):
+        return interaction.response.send_message(embed=msg)
+    else:
+        return interaction.response.send_message(content=msg)
 
 TOKEN = os.environ.get("BOT_TOKEN")
 
