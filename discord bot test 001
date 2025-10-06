@@ -242,6 +242,9 @@ async def add_role_with_timestamp(member, role, reason=None):
         if role in member.roles:
             return True
         now_ts = now_jst().timestamp()
+        # --- ロール新規付与時は個人削除期間設定をリセット ---
+        if role.name in ROLES_TO_AUTO_REMOVE:
+            bot.data.remove_user_setting(guild_id, user_id, role.name)
         if role.name in ROLES_TO_AUTO_REMOVE and role.name not in bot.data.role_data[guild_id][user_id]:
             bot.data.role_data[guild_id][user_id][role.name] = now_ts
             bot.data.add_role_history(guild_id, user_id, role.name, now_ts)
@@ -438,7 +441,7 @@ class ReasonModal(Modal, title="理由を編集"):
                 ephemeral=True
             )
             await self.view_instance.update_view(interaction.message)
-            # ログ送信
+            # ログ追加
             guild = interaction.guild
             user = guild.get_member(int(self.user_id)) if guild else None
             user_name = user.display_name if user else self.user_id
@@ -598,29 +601,28 @@ async def show_role_history(interaction: discord.Interaction, user: discord.Memb
             description="履歴がありません。",
             color=0x0099ff
         )
-        await send_success(interaction, embed)
+        await interaction.response.send_message(embed=embed)
         return
     view = RoleHistoryView(guild_id, user_id, user.display_name, history)
     embed = view.create_embed()
-    await send_success(interaction, embed)
-    await interaction.response.edit_message(embed=embed, view=view)
+    await interaction.response.send_message(embed=embed, view=view)
 
 @bot.tree.command(name="giveall", description="全員に指定ロールを付与（管理者限定）")
 @app_commands.describe(role="付与するロール")
 async def giveall(interaction: discord.Interaction, role: discord.Role):
-    if not is_admin(interaction.user):
-        await send_error(interaction, "❌ 管理者権限が必要です。")
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 管理者権限が必要です。", ephemeral=True)
         return
     if role >= interaction.guild.me.top_role:
-        await send_error(interaction, "❌ そのロールは付与できません")
+        await interaction.response.send_message("❌ そのロールは付与できません", ephemeral=True)
         return
     await interaction.response.defer(thinking=True)
     members = [m for m in interaction.guild.members if not m.bot and role not in m.roles]
     if not members:
-        await send_success(interaction, "✅ 全員が既にロールを持っています。")
+        await interaction.followup.send("✅ 全員が既にロールを持っています。")
         return
     progress_msg = await interaction.followup.send(f"🔄 {role.name} を {len(members)} 人に付与中...")
-    success = 0
+    success = 0                                                 
     for i, member in enumerate(members):
         if await add_role_with_timestamp(member, role, f"一括付与 by {interaction.user.display_name}"):
             success += 1
@@ -640,10 +642,10 @@ async def giveall(interaction: discord.Interaction, role: discord.Role):
 @app_commands.describe(role="付与するロール")
 async def test_add(interaction: discord.Interaction, role: discord.Role):
     if role >= interaction.guild.me.top_role:
-        await send_error(interaction, f"❌ そのロールは付与できません")
+        await interaction.response.send_message("❌ そのロールは付与できません", ephemeral=True)
         return
     if role in interaction.user.roles:
-        await send_error(interaction, f"ℹ️ 既に {role.name} を持っています")
+        await interaction.response.send_message(f"ℹ️ 既に {role.name} を持っています", ephemeral=True)
         return
     result = await add_role_with_timestamp(interaction.user, role, "テストコマンド")
     if result:
@@ -651,13 +653,35 @@ async def test_add(interaction: discord.Interaction, role: discord.Role):
         if role.name in ROLES_TO_AUTO_REMOVE:
             seconds = bot.data.get_remove_seconds(str(interaction.guild.id), str(interaction.user.id), role.name)
             msg += f"\n⏰ {format_duration(seconds)}後に自動削除"
-        await send_success(interaction, msg)
+        await interaction.response.send_message(msg)
     else:
-        await send_error(interaction, "❌ 付与に失敗しました")
+        await interaction.response.send_message("❌ 付与に失敗しました", ephemeral=True)
+
+@bot.tree.command(name="status", description="Bot状態表示")
+async def status(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    tracked = len(bot.data.role_data.get(guild_id, {}))
+    log_channel_id = bot.data.guild_log_channels.get(guild_id)
+    log_channel = interaction.guild.get_channel(log_channel_id) if log_channel_id else None
+    log_channel_disp = log_channel.mention if log_channel else "未設定"
+    debug_mode = "ON" if DEBUG else "OFF"
+    embed = await create_embed(
+        "Bot ステータス", 0x00ff00,
+        追跡中ユーザー=f"{tracked}人",
+        チェック間隔=f"{CHECK_INTERVAL//60}分",
+        同期間隔=f"{SYNC_INTERVAL//60}分",
+        タイムゾーン="日本時間 (JST)",
+        ログ送信先=log_channel_disp,
+        デバッグモード=debug_mode
+    )
+    remove_info = [f"{role}: {format_duration(bot.data.settings['remove_seconds'].get(role, DEFAULT_REMOVE_SECONDS[role]))}" for role in ROLES_TO_AUTO_REMOVE]
+    embed.add_field(name="自動削除期間", value="\n".join(remove_info), inline=False)
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="set_remove_period", description="デフォルト削除期間設定（管理者限定）")
 @app_commands.describe(role="ロール名", days="日", hours="時間", minutes="分", seconds="秒")
 @app_commands.choices(role=[app_commands.Choice(name=r, value=r) for r in ROLES_TO_AUTO_REMOVE])
+@admin_required
 async def set_remove_period(
     interaction: discord.Interaction,
     role: str,
@@ -666,12 +690,9 @@ async def set_remove_period(
     minutes: int = 0,
     seconds: int = 0
 ):
-    if not is_admin(interaction.user):
-        await send_error(interaction, "❌ 管理者権限が必要です。")
-        return
     total_seconds = parse_duration(days, hours, minutes, seconds)
     if total_seconds < 0:
-        await send_error(interaction, "❌ 期間は0以上で指定してください")
+        await interaction.response.send_message("❌ 期間は0以上で指定してください", ephemeral=True)
         return
     old_seconds = bot.data.settings["remove_seconds"].get(role, DEFAULT_REMOVE_SECONDS[role])
     bot.data.settings["remove_seconds"][role] = total_seconds
@@ -682,70 +703,81 @@ async def set_remove_period(
         変更前=format_duration(old_seconds),
         変更後=format_duration(total_seconds)
     )
-    await send_success(interaction, embed)
+    await interaction.response.send_message(embed=embed)
     await log_message(interaction.guild, f"{interaction.user.display_name} が '{role}' 期間を {format_duration(old_seconds)}→{format_duration(total_seconds)}に変更", "info")
 
-@bot.tree.command(name="set_user_period", description="個人削除期間設定（管理者限定）")
-@app_commands.describe(user="対象ユーザー", role="ロール名", days="日", hours="時間", minutes="分", seconds="秒")
+@bot.tree.command(name="adjust_remove_time", description="個人のロール削除までの残り時間を増加・減少・セット（管理者限定）")
+@app_commands.describe(
+    user="対象ユーザー",
+    role="ロール名",
+    action="操作（増加/減少/セット）",
+    days="日",
+    hours="時間",
+    minutes="分",
+    seconds="秒"
+)
 @app_commands.choices(role=[app_commands.Choice(name=r, value=r) for r in ROLES_TO_AUTO_REMOVE])
-async def set_user_period(
+@app_commands.choices(action=[
+    app_commands.Choice(name="増加", value="add"),
+    app_commands.Choice(name="減少", value="sub"),
+    app_commands.Choice(name="セット", value="set")
+])
+@admin_required
+async def adjust_remove_time(
     interaction: discord.Interaction,
     user: discord.Member,
     role: str,
+    action: str,
     days: int = 0,
     hours: int = 0,
     minutes: int = 0,
     seconds: int = 0
 ):
-    if not is_admin(interaction.user):
-        await send_error(interaction, "❌ 管理者権限が必要です。")
+    guild_id, user_id = str(interaction.guild.id), str(user.id)
+    role_data = bot.data.role_data.get(guild_id, {}).get(user_id, {})
+    if role not in role_data:
+        await interaction.response.send_message(f"❌ {user.display_name} は現在 {role} を持っていません。", ephemeral=True)
         return
-    total_seconds = parse_duration(days, hours, minutes, seconds)
-    guild_id, user_id = str(interaction.guild.id), str(user.id)
-    current_seconds = bot.data.get_remove_seconds(guild_id, user_id, role)
-    default_seconds = bot.data.settings["remove_seconds"].get(role, DEFAULT_REMOVE_SECONDS[role])
-    if total_seconds == 0:
-        removed = bot.data.remove_user_setting(guild_id, user_id, role)
-        title = "✅ 個人設定削除完了" if removed else "ℹ️ 個人設定なし"
-        change = f"{format_duration(current_seconds)} → デフォルト({format_duration(default_seconds)})" if removed else "変更なし"
-        log_msg = f"{interaction.user.display_name} が {user.display_name} の '{role}' 個人削除期間設定を削除 ({format_duration(current_seconds)} → デフォルト)"
+    now = now_jst().timestamp()
+    assigned_ts = role_data[role]
+    remove_seconds = bot.data.get_remove_seconds(guild_id, user_id, role)
+    remain = assigned_ts + remove_seconds - now
+    if remain <= 0:
+        await interaction.response.send_message(f"❌ 既に削除対象です。", ephemeral=True)
+        return
+    delta = parse_duration(days, hours, minutes, seconds)
+    if action == "add":
+        new_remain = remain + delta
+    elif action == "sub":
+        new_remain = max(0, remain - delta)
+    elif action == "set":
+        new_remain = max(0, delta)
     else:
-        bot.data.set_user_remove_seconds(guild_id, user_id, role, total_seconds)
-        title = "✅ 個人削除期間設定完了"
-        change = f"{format_duration(current_seconds)} → {format_duration(total_seconds)}"
-        log_msg = f"{interaction.user.display_name} が {user.display_name} の '{role}' 個人削除期間設定を変更 ({format_duration(current_seconds)} → {format_duration(total_seconds)})"
+        await interaction.response.send_message("❌ 不正な操作です。", ephemeral=True)
+        return
+    if new_remain <= 0:
+        # 0秒セット時は個人設定削除（デフォルトに戻す）
+        removed = bot.data.remove_user_setting(guild_id, user_id, role)
+        await bot.data.save_all()
+        msg = f"✅ {user.display_name} の {role} の個人削除期間設定を削除しデフォルトに戻しました。"
+        await interaction.response.send_message(msg)
+        await log_message(interaction.guild, f"{interaction.user.display_name} が {user.display_name} の {role} の個人削除期間設定を削除", "info")
+        return
+    # 付与時刻はそのまま、個人削除期間を今からnew_remain秒に設定
+    bot.data.set_user_remove_seconds(guild_id, user_id, role, int(now - assigned_ts + new_remain))
     await bot.data.save_all()
-    embed = await create_embed(title, 0x00ff00,
-                              ユーザー=user.display_name, ロール=role, 変更=change)
-    await send_success(interaction, embed)
-    await log_message(interaction.guild, log_msg, "info")
-
-@bot.tree.command(name="show_user_period", description="個人削除期間表示")
-@app_commands.describe(user="対象ユーザー（省略時は自分）")
-async def show_user_period(interaction: discord.Interaction, user: discord.Member = None):
-    user = user or interaction.user
-    guild_id, user_id = str(interaction.guild.id), str(user.id)
-    embed = discord.Embed(title=f"🗑️ {user.display_name} の削除期間設定", color=0x0099ff)
-    for role_name in ROLES_TO_AUTO_REMOVE:
-        personal_seconds = bot.data.settings.get("user_remove_seconds", {}).get(guild_id, {}).get(user_id, {}).get(role_name)
-        default_seconds = bot.data.settings["remove_seconds"].get(role_name, DEFAULT_REMOVE_SECONDS[role_name])
-        value = (
-            f"**{format_duration(personal_seconds)}** (個人設定)\nデフォルト: {format_duration(default_seconds)}"
-            if personal_seconds else f"{format_duration(default_seconds)} (デフォルト)"
-        )
-        embed.add_field(name=role_name, value=value, inline=True)
-    await send_success(interaction, embed)
+    msg = f"✅ {user.display_name} の {role} の残り時間を {format_duration(remain)} → {format_duration(new_remain)} に{('増加' if action=='add' else '減少' if action=='sub' else 'セット')}しました。"
+    await interaction.response.send_message(msg)
+    await log_message(interaction.guild, f"{interaction.user.display_name} が {user.display_name} の {role} の残り時間を {format_duration(remain)} → {format_duration(new_remain)} に{('増加' if action=='add' else '減少' if action=='sub' else 'セット')}", "info")
 
 @bot.tree.command(name="sync_check", description="手動同期・チェック実行（管理者限定）")
+@admin_required
 async def sync_check(interaction: discord.Interaction):
-    if not is_admin(interaction.user):
-        await send_error(interaction, "❌ 管理者権限が必要です。")
-        return
     await interaction.response.defer(thinking=True)
     await sync_data_with_reality(interaction.guild)
     removed = await process_role_removal(interaction.guild)
     await bot.data.save_all()
-    await send_success(interaction, f"✅ 手動同期完了\n削除されたロール: {removed}個")
+    await interaction.followup.send(f"✅ 手動同期完了\n削除されたロール: {removed}個")
     await log_message(interaction.guild, f"{interaction.user.display_name} が手動同期実行: {removed}個削除", "info")
 
 @bot.tree.command(name="set_log_channel", description="このチャンネルをログ送信先に設定（管理者限定）")
@@ -753,9 +785,9 @@ async def sync_check(interaction: discord.Interaction):
 async def set_log_channel(interaction: discord.Interaction):
     bot.data.guild_log_channels[str(interaction.guild.id)] = interaction.channel.id
     await bot.data.save_all()
-    await send_success(interaction, f"✅ ログ送信先を {interaction.channel.mention} に設定しました")
-    # ログ送信
-    await log_message(interaction.guild, f"{interaction.user.display_name} がログ送信先を {interaction.channel.mention} に変更", "info")
+    await interaction.response.send_message(f"✅ ログ送信先を {interaction.channel.mention} に設定しました", ephemeral=True)
+    # ログ追加
+    await log_message(interaction.guild, f"{interaction.user.display_name} がログ送信先を {interaction.channel.mention} に設定", "info")
 
 @bot.tree.command(name="message", description="指定したチャンネルにメッセージを送信")
 @app_commands.describe(
@@ -805,14 +837,14 @@ async def help_command(interaction: discord.Interaction):
     commands_info = {
         "/giveall": "全員にロール付与（管理者限定）",
         "/test_add": "自分にロール付与（テスト用）",
+        "/status": "Bot状態表示",
         "/set_remove_period": "デフォルト削除期間設定（管理者限定）",
-        "/set_user_period": "個人削除期間設定（管理者限定）",
-        "/show_user_period": "個人削除期間表示",
+        "/adjust_remove_time": "個人のロール削除までの残り時間を増加・減少・セット（管理者限定）",
+        "/show_remove_time": "自動削除ロールの残り時間を表示",
         "/show_role_history": "ロール付与履歴表示（注意・警告のみ。理由編集機能付き）",
         "/sync_check": "手動同期・チェック（管理者限定）",
         "/set_log_channel": "このチャンネルをログ送信先に設定（管理者限定）",
-        "/message": "指定したチャンネルにメッセージ送信",
-        "/show_settings": "Botの設定情報を表示（管理者限定）"
+        "/message": "指定したチャンネルにメッセージ送信"
     }
     for cmd, desc in commands_info.items():
         embed.add_field(name=cmd, value=desc, inline=False)
@@ -821,81 +853,49 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "• 自動削除対象: " + ", ".join(ROLES_TO_AUTO_REMOVE) +
             "\n• 不定期起動対応"
-            "\n• 個人別削除期間設定可能"
             "\n• ロール付与履歴確認・理由編集可能（注意・警告のみ）"
             "\n• ページネーション対応（各ロール5件ずつ表示）"
             "\n• 理由編集後の自動更新機能"
             "\n• ログ送信先チャンネルをサーバーごとに設定可能"
             "\n• `/message` で好きなメッセージを任意のチャンネルに投稿可能"
             "\n   例: `/message Hello world! general`"
-            "\n• `/show_settings` でBotの全設定を確認可能"
+            "\n• `/adjust_remove_time` で個人のロール削除までの残り時間を柔軟に調整可能"
+            "\n• `/show_remove_time` で自動削除ロールの残り時間を確認可能"
         ),
         inline=False
     )
-    await send_success(interaction, embed)
+    await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="show_settings", description="Botの設定情報を表示（管理者限定）")
-async def show_settings(interaction: discord.Interaction):
-    if not is_admin(interaction.user):
-        await send_error(interaction, "❌ 管理者権限が必要です。")
-        return
-    guild_id = str(interaction.guild.id)
-    # ログ送信先チャンネル
-    log_channel_id = bot.data.guild_log_channels.get(guild_id)
-    log_channel = interaction.guild.get_channel(log_channel_id) if log_channel_id else None
-    log_channel_str = f"{log_channel.mention} (ID: {log_channel_id})" if log_channel else "未設定"
-    # 自動削除対象ロールと期間
-    auto_remove_info = []
-    for role in ROLES_TO_AUTO_REMOVE:
-        seconds = bot.data.settings["remove_seconds"].get(role, DEFAULT_REMOVE_SECONDS[role])
-        auto_remove_info.append(f"{role}: {format_duration(seconds)}")
-    # 個人削除期間設定の件数とユーザー名
-    user_settings = bot.data.settings.get("user_remove_seconds", {}).get(guild_id, {})
-    user_list = []
-    for user_id in user_settings.keys():
-        member = interaction.guild.get_member(int(user_id))
-        name = member.display_name if member else f"ID:{user_id}"
-        user_list.append(name)
-    user_settings_str = f"{len(user_list)}件: " + ", ".join(user_list) if user_list else "0件"
-    # DEBUGモード
-    debug_str = "ON" if DEBUG else "OFF"
-    # 追跡中ユーザー数
-    tracked = len(bot.data.role_data.get(guild_id, {}))
-    # チェック間隔・同期間隔・タイムゾーン
-    check_str = f"{CHECK_INTERVAL//60}分"
-    sync_str = f"{SYNC_INTERVAL//60}分"
-    tz_str = "日本時間 (JST)"
-    embed = discord.Embed(title="🔧 Bot設定情報", color=0x00ff00)
-    embed.add_field(name="ログ送信先チャンネル", value=log_channel_str, inline=False)
-    embed.add_field(name="自動削除対象ロールと期間", value="\n".join(auto_remove_info), inline=False)
-    embed.add_field(name="個人削除期間設定", value=user_settings_str, inline=False)
-    embed.add_field(name="DEBUGモード", value=debug_str, inline=True)
-    embed.add_field(name="追跡中ユーザー数", value=f"{tracked}人", inline=True)
-    embed.add_field(name="チェック間隔", value=check_str, inline=True)
-    embed.add_field(name="同期間隔", value=sync_str, inline=True)
-    embed.add_field(name="タイムゾーン", value=tz_str, inline=True)
-    await send_success(interaction, embed)
+@bot.tree.command(name="show_remove_time", description="指定ユーザーの自動削除ロールの残り時間を表示")
+@app_commands.describe(user="対象ユーザー（省略時は自分）")
+async def show_remove_time(interaction: discord.Interaction, user: discord.Member = None):
+    user = user or interaction.user
+    guild_id, user_id = str(interaction.guild.id), str(user.id)
+    role_data = bot.data.role_data.get(guild_id, {}).get(user_id, {})
+    now = now_jst().timestamp()
+    embed = discord.Embed(title=f"⏰ {user.display_name} のロール削除までの残り時間", color=0x0099ff)
+    found = False
+    for role_name in ROLES_TO_AUTO_REMOVE:
+        if role_name in role_data:
+            assigned_ts = role_data[role_name]
+            remove_seconds = bot.data.get_remove_seconds(guild_id, user_id, role_name)
+            remain = int(assigned_ts + remove_seconds - now)
+            if remain > 0:
+                embed.add_field(name=role_name, value=f"残り: {format_duration(remain)}", inline=True)
+            else:
+                embed.add_field(name=role_name, value="削除対象（まもなく削除）", inline=True)
+            found = True
+        else:
+            embed.add_field(name=role_name, value="未付与", inline=True)
+    if not found:
+        embed.description = "自動削除対象ロールは付与されていません。"
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     logger.error(f"Application command error: {error}", exc_info=True)
     if not interaction.response.is_done():
         await interaction.response.send_message("❌ 予期しないエラーが発生しました。", ephemeral=True)
-
-def is_admin(user):
-    return getattr(user.guild_permissions, "administrator", False)
-
-def send_error(interaction, msg):
-    if isinstance(msg, discord.Embed):
-        return interaction.response.send_message(embed=msg, ephemeral=True)
-    else:
-        return interaction.response.send_message(content=msg, ephemeral=True)
-
-def send_success(interaction, msg):
-    if isinstance(msg, discord.Embed):
-        return interaction.response.send_message(embed=msg)
-    else:
-        return interaction.response.send_message(content=msg)
 
 TOKEN = os.environ.get("BOT_TOKEN")
 
